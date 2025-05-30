@@ -1,328 +1,545 @@
 #!/usr/bin/env python3
 """
-Real-time IMU Data Visualizer
-Reads BMI088 + Madgwick filter data from Arduino and displays:
-- 3D orientation visualization 
-- Real-time sensor plots
-- Euler angles display
+BMI088 IMU Real-Time Dashboard
+Live visualization of sensor data with multiple plots and metrics
 """
 
-import serial
-import numpy as np
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.animation import FuncAnimation
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.patches import Rectangle
-import time
-from collections import deque
+import numpy as np
+import serial
 import threading
 import queue
+import time
+from collections import deque
+import json
+import os
+from datetime import datetime
 
-class IMUVisualizer:
-    def __init__(self, port='COM3', baudrate=115200, buffer_size=100):
-        """
-        Initialize the IMU visualizer
-        
-        Args:
-            port: Serial port (e.g., 'COM3' on Windows, '/dev/ttyUSB0' on Linux)
-            baudrate: Serial communication speed
-            buffer_size: Number of data points to keep in memory
-        """
-        self.port = port
-        self.baudrate = baudrate
-        self.buffer_size = buffer_size
-        
-        # Data storage
-        self.data_queue = queue.Queue()
-        self.timestamps = deque(maxlen=buffer_size)
-        self.accel_data = {'x': deque(maxlen=buffer_size), 
-                          'y': deque(maxlen=buffer_size), 
-                          'z': deque(maxlen=buffer_size)}
-        self.gyro_data = {'x': deque(maxlen=buffer_size), 
-                         'y': deque(maxlen=buffer_size), 
-                         'z': deque(maxlen=buffer_size)}
-        self.euler_data = {'roll': deque(maxlen=buffer_size),
-                          'pitch': deque(maxlen=buffer_size),
-                          'yaw': deque(maxlen=buffer_size)}
-        self.quaternion = {'q0': 1, 'q1': 0, 'q2': 0, 'q3': 0}
-        self.temperature = 0
-        
-        # Current orientation
-        self.current_roll = 0
-        self.current_pitch = 0
-        self.current_yaw = 0
+class BMI088Dashboard:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("BMI088 IMU Real-Time Dashboard")
+        self.root.geometry("1400x900")
         
         # Serial connection
-        self.serial_conn = None
-        self.running = False
+        self.ser = None
+        self.connected = False
+        self.data_queue = queue.Queue()
+        self.serial_thread = None
         
-    def connect_serial(self):
-        """Connect to Arduino via serial"""
-        try:
-            self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=1)
-            time.sleep(2)  # Wait for Arduino to reset
-            print(f"Connected to {self.port} at {self.baudrate} baud")
-            return True
-        except Exception as e:
-            print(f"Failed to connect to {self.port}: {e}")
-            return False
-    
-    def read_serial_data(self):
-        """Read data from serial port in separate thread"""
-        start_time = time.time()
+        # Data storage (keep last 1000 points for smooth plotting)
+        self.max_points = 1000
+        self.time_data = deque(maxlen=self.max_points)
         
-        while self.running:
-            try:
-                if self.serial_conn and self.serial_conn.in_waiting:
-                    line = self.serial_conn.readline().decode('utf-8').strip()
+        # Accelerometer data
+        self.acc_x = deque(maxlen=self.max_points)
+        self.acc_y = deque(maxlen=self.max_points)
+        self.acc_z = deque(maxlen=self.max_points)
+        
+        # Gravity-compensated acceleration
+        self.g_acc_x = deque(maxlen=self.max_points)
+        self.g_acc_y = deque(maxlen=self.max_points)
+        self.g_acc_z = deque(maxlen=self.max_points)
+        
+        # Gyroscope data
+        self.gyro_x = deque(maxlen=self.max_points)
+        self.gyro_y = deque(maxlen=self.max_points)
+        self.gyro_z = deque(maxlen=self.max_points)
+        
+        # Orientation data
+        self.roll = deque(maxlen=self.max_points)
+        self.pitch = deque(maxlen=self.max_points)
+        self.yaw = deque(maxlen=self.max_points)
+        
+        # Velocity and position
+        self.vel_x = deque(maxlen=self.max_points)
+        self.vel_y = deque(maxlen=self.max_points)
+        self.vel_z = deque(maxlen=self.max_points)
+        self.pos_x = deque(maxlen=self.max_points)
+        self.pos_y = deque(maxlen=self.max_points)
+        self.pos_z = deque(maxlen=self.max_points)
+        
+        # Status data
+        self.temperature = deque(maxlen=self.max_points)
+        self.stationary = deque(maxlen=self.max_points)
+        
+        # Statistics
+        self.sample_count = 0
+        self.start_time = None
+        self.last_update = time.time()
+        
+        # Setup GUI
+        self.setup_gui()
+        self.setup_plots()
+        
+        # Start animation
+        self.ani = FuncAnimation(self.fig, self.update_plots, interval=50, blit=False)
+        
+    def setup_gui(self):
+        """Setup the GUI layout"""
+        # Main frame
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Control panel (top)
+        control_frame = ttk.LabelFrame(main_frame, text="Control Panel", padding=10)
+        control_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        # Serial connection controls
+        serial_frame = ttk.Frame(control_frame)
+        serial_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        ttk.Label(serial_frame, text="Port:").pack(side=tk.LEFT)
+        self.port_var = tk.StringVar(value="COM5")
+        port_entry = ttk.Entry(serial_frame, textvariable=self.port_var, width=10)
+        port_entry.pack(side=tk.LEFT, padx=(5, 10))
+        
+        self.connect_btn = ttk.Button(serial_frame, text="Connect", command=self.toggle_connection)
+        self.connect_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Status indicators
+        status_frame = ttk.Frame(control_frame)
+        status_frame.pack(side=tk.RIGHT)
+        
+        self.status_label = ttk.Label(status_frame, text="Status: Disconnected", foreground="red")
+        self.status_label.pack(side=tk.LEFT, padx=10)
+        
+        self.rate_label = ttk.Label(status_frame, text="Rate: 0.0 Hz")
+        self.rate_label.pack(side=tk.LEFT, padx=10)
+        
+        self.samples_label = ttk.Label(status_frame, text="Samples: 0")
+        self.samples_label.pack(side=tk.LEFT, padx=10)
+        
+        # Action buttons
+        action_frame = ttk.Frame(control_frame)
+        action_frame.pack(side=tk.RIGHT, padx=(20, 0))
+        
+        ttk.Button(action_frame, text="Save Data", command=self.save_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Clear Data", command=self.clear_data).pack(side=tk.LEFT, padx=5)
+        
+        # Metrics panel (left side)
+        metrics_frame = ttk.LabelFrame(main_frame, text="Live Metrics", padding=10)
+        metrics_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        
+        self.setup_metrics_panel(metrics_frame)
+        
+        # Plots panel (right side)
+        plots_frame = ttk.Frame(main_frame)
+        plots_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Create matplotlib figure
+        self.fig, self.axes = plt.subplots(3, 2, figsize=(12, 8))
+        self.fig.tight_layout(pad=3.0)
+        
+        # Embed matplotlib in tkinter
+        self.canvas = FigureCanvasTkAgg(self.fig, plots_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+    def setup_metrics_panel(self, parent):
+        """Setup the live metrics display"""
+        self.metric_vars = {}
+        
+        metrics = [
+            ("Acceleration (m/s²)", ["X", "Y", "Z"]),
+            ("Linear Accel (m/s²)", ["X", "Y", "Z"]),
+            ("Gyroscope (°/s)", ["X", "Y", "Z"]),
+            ("Orientation (°)", ["Roll", "Pitch", "Yaw"]),
+            ("Velocity (m/s)", ["X", "Y", "Z"]),
+            ("Position (m)", ["X", "Y", "Z"]),
+            ("Status", ["Temp (°C)", "Stationary", ""])
+        ]
+        
+        for section, items in metrics:
+            # Section header
+            section_frame = ttk.LabelFrame(parent, text=section, padding=5)
+            section_frame.pack(fill=tk.X, pady=5)
+            
+            for item in items:
+                if item:  # Skip empty items
+                    frame = ttk.Frame(section_frame)
+                    frame.pack(fill=tk.X, pady=1)
                     
-                    # Skip header lines
-                    if line.startswith('BMI088') or line.startswith('ax(') or line.startswith('BMI088 is'):
+                    ttk.Label(frame, text=f"{item}:", width=10).pack(side=tk.LEFT)
+                    var = tk.StringVar(value="0.000")
+                    self.metric_vars[f"{section}_{item}"] = var
+                    ttk.Label(frame, textvariable=var, width=10, foreground="blue").pack(side=tk.LEFT)
+        
+    def setup_plots(self):
+        """Setup the plot configurations"""
+        # Plot titles and configurations
+        plot_configs = [
+            ("Raw Accelerometer", "Time (s)", "Acceleration (m/s²)"),
+            ("Linear Acceleration", "Time (s)", "Acceleration (m/s²)"),
+            ("Gyroscope", "Time (s)", "Angular Velocity (°/s)"),
+            ("Orientation", "Time (s)", "Angle (°)"),
+            ("Velocity", "Time (s)", "Velocity (m/s)"),
+            ("Position", "Time (s)", "Position (m)")
+        ]
+        
+        # Setup each subplot
+        for i, (title, xlabel, ylabel) in enumerate(plot_configs):
+            row, col = i // 2, i % 2
+            ax = self.axes[row, col]
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel(xlabel, fontsize=8)
+            ax.set_ylabel(ylabel, fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(labelsize=8)
+        
+        # Set dark background for better visibility
+        plt.style.use('default')
+        self.fig.patch.set_facecolor('white')
+        
+    def toggle_connection(self):
+        """Toggle serial connection"""
+        if self.connected:
+            self.disconnect()
+        else:
+            self.connect()
+    
+    def connect(self):
+        """Connect to serial port"""
+        try:
+            port = self.port_var.get()
+            self.ser = serial.Serial(port, 115200, timeout=1)
+            time.sleep(2)  # Allow Arduino to reset
+            self.ser.flushInput()
+            
+            self.connected = True
+            self.start_time = time.time()
+            self.sample_count = 0
+            
+            # Start serial reading thread
+            self.serial_thread = threading.Thread(target=self.read_serial, daemon=True)
+            self.serial_thread.start()
+            
+            # Update GUI
+            self.connect_btn.config(text="Disconnect")
+            self.status_label.config(text="Status: Connected", foreground="green")
+            
+            messagebox.showinfo("Success", f"Connected to {port}")
+            
+        except Exception as e:
+            messagebox.showerror("Connection Error", f"Failed to connect: {str(e)}")
+    
+    def disconnect(self):
+        """Disconnect from serial port"""
+        self.connected = False
+        
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        
+        self.connect_btn.config(text="Connect")
+        self.status_label.config(text="Status: Disconnected", foreground="red")
+        self.rate_label.config(text="Rate: 0.0 Hz")
+    
+    def read_serial(self):
+        """Read data from serial port in separate thread"""
+        while self.connected:
+            try:
+                if self.ser.in_waiting:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    # Skip header lines or debug messages
+                    if not line or "BMI088" in line or "bias" in line:
                         continue
                     
-                    # Parse CSV data
-                    try:
-                        data = [float(x) for x in line.split(',')]
-                        if len(data) >= 14:  # Ensure we have all expected data (14 values total)
-                            timestamp = time.time() - start_time
-                            
-                            # Store data according to new format:
-                            # ax, ay, az, gx, gy, gz, temp, roll, pitch, yaw, q0, q1, q2, q3
-                            data_dict = {
-                                'timestamp': timestamp,
-                                'ax': data[0], 'ay': data[1], 'az': data[2],
-                                'gx': data[3], 'gy': data[4], 'gz': data[5],
-                                'temp': data[6],
-                                'roll': data[7], 'pitch': data[8], 'yaw': data[9],
-                                'q0': data[10], 'q1': data[11], 'q2': data[12], 'q3': data[13]
-                            }
-                            
-                            self.data_queue.put(data_dict)
-                            
-                    except (ValueError, IndexError):
-                        continue  # Skip malformed lines
-                        
-            except Exception as e:
-                print(f"Serial read error: {e}")
-                break
+                    # Parse data
+                    data = self.parse_data_line(line)
+                    if data:
+                        self.data_queue.put(data)
                 
-            time.sleep(0.01)  # Small delay to prevent excessive CPU usage
+                time.sleep(0.001)  # Small delay
+                
+            except Exception as e:
+                if self.connected:  # Only show error if we should be connected
+                    print(f"Serial read error: {e}")
+                break
     
-    def update_data_buffers(self):
-        """Update internal data buffers from queue"""
+    def parse_data_line(self, line):
+        """Parse a line of data from Arduino"""
+        try:
+            values = line.split(',')
+            if len(values) != 30:  # Expected number of values
+                return None
+            
+            # Convert to floats
+            data = [float(v) for v in values]
+            return data
+            
+        except (ValueError, IndexError):
+            return None
+    
+    def update_plots(self, frame):
+        """Update plots with new data"""
+        # Process any new data from queue
         while not self.data_queue.empty():
             try:
                 data = self.data_queue.get_nowait()
-                
-                # Update buffers
-                self.timestamps.append(data['timestamp'])
-                self.accel_data['x'].append(data['ax'])
-                self.accel_data['y'].append(data['ay'])
-                self.accel_data['z'].append(data['az'])
-                self.gyro_data['x'].append(data['gx'])
-                self.gyro_data['y'].append(data['gy'])
-                self.gyro_data['z'].append(data['gz'])
-                self.euler_data['roll'].append(data['roll'])
-                self.euler_data['pitch'].append(data['pitch'])
-                self.euler_data['yaw'].append(data['yaw'])
-                
-                # Update current values
-                self.current_roll = data['roll']
-                self.current_pitch = data['pitch']
-                self.current_yaw = data['yaw']
-                self.quaternion = {'q0': data['q0'], 'q1': data['q1'], 
-                                 'q2': data['q2'], 'q3': data['q3']}
-                self.temperature = data['temp']
-                
+                self.add_data_point(data)
             except queue.Empty:
                 break
-    
-    def quaternion_to_rotation_matrix(self, q0, q1, q2, q3):
-        """Convert quaternion to rotation matrix"""
-        # Normalize quaternion
-        norm = np.sqrt(q0**2 + q1**2 + q2**2 + q3**2)
-        q0, q1, q2, q3 = q0/norm, q1/norm, q2/norm, q3/norm
         
-        # Rotation matrix
-        R = np.array([
-            [1-2*(q2**2+q3**2), 2*(q1*q2-q0*q3), 2*(q1*q3+q0*q2)],
-            [2*(q1*q2+q0*q3), 1-2*(q1**2+q3**2), 2*(q2*q3-q0*q1)],
-            [2*(q1*q3-q0*q2), 2*(q2*q3+q0*q1), 1-2*(q1**2+q2**2)]
-        ])
-        return R
-    
-    def draw_3d_object(self, ax, R):
-        """Draw a 3D object (airplane-like) showing orientation"""
-        ax.clear()
+        # Update rate calculation
+        current_time = time.time()
+        if self.start_time:
+            elapsed = current_time - self.start_time
+            rate = self.sample_count / elapsed if elapsed > 0 else 0
+            self.rate_label.config(text=f"Rate: {rate:.1f} Hz")
+            self.samples_label.config(text=f"Samples: {self.sample_count}")
         
-        # Define airplane vertices (relative to body frame)
-        # Main body
-        body = np.array([
-            [2, 0, 0],    # Nose
-            [-1, 0, 0],   # Tail
-        ])
+        # Clear all axes
+        for ax in self.axes.flat:
+            ax.clear()
         
-        # Wings
-        wings = np.array([
-            [0, -1.5, 0], # Left wing tip
-            [0, 1.5, 0],  # Right wing tip
-            [0, 0, 0],    # Wing center
-        ])
-        
-        # Vertical stabilizer
-        vstab = np.array([
-            [-1, 0, 0],   # Tail
-            [-1, 0, 0.8], # Top of vertical stabilizer
-        ])
-        
-        # Apply rotation matrix
-        body_rot = (R @ body.T).T
-        wings_rot = (R @ wings.T).T
-        vstab_rot = (R @ vstab.T).T
-        
-        # Plot body
-        ax.plot(body_rot[:, 0], body_rot[:, 1], body_rot[:, 2], 'b-', linewidth=3, label='Body')
-        
-        # Plot wings
-        ax.plot([wings_rot[0, 0], wings_rot[2, 0], wings_rot[1, 0]], 
-                [wings_rot[0, 1], wings_rot[2, 1], wings_rot[1, 1]], 
-                [wings_rot[0, 2], wings_rot[2, 2], wings_rot[1, 2]], 'g-', linewidth=2, label='Wings')
-        
-        # Plot vertical stabilizer
-        ax.plot(vstab_rot[:, 0], vstab_rot[:, 1], vstab_rot[:, 2], 'r-', linewidth=2, label='V-Stab')
-        
-        # Draw coordinate axes
-        axes_length = 1.0
-        origin = np.array([0, 0, 0])
-        
-        # X-axis (red)
-        x_axis = (R @ np.array([axes_length, 0, 0]))
-        ax.plot([origin[0], x_axis[0]], [origin[1], x_axis[1]], [origin[2], x_axis[2]], 'r-', alpha=0.7)
-        
-        # Y-axis (green)
-        y_axis = (R @ np.array([0, axes_length, 0]))
-        ax.plot([origin[0], y_axis[0]], [origin[1], y_axis[1]], [origin[2], y_axis[2]], 'g-', alpha=0.7)
-        
-        # Z-axis (blue)
-        z_axis = (R @ np.array([0, 0, axes_length]))
-        ax.plot([origin[0], z_axis[0]], [origin[1], z_axis[1]], [origin[2], z_axis[2]], 'b-', alpha=0.7)
-        
-        # Set equal aspect ratio and limits
-        ax.set_xlim(-2, 2)
-        ax.set_ylim(-2, 2)
-        ax.set_zlim(-2, 2)
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title('IMU Orientation (3D)')
-        
-        # Add text display
-        ax.text2D(0.02, 0.98, f'Roll: {self.current_roll:.1f}°', transform=ax.transAxes, 
-                 verticalalignment='top', fontsize=10, bbox=dict(boxstyle="round", facecolor='wheat'))
-        ax.text2D(0.02, 0.90, f'Pitch: {self.current_pitch:.1f}°', transform=ax.transAxes, 
-                 verticalalignment='top', fontsize=10, bbox=dict(boxstyle="round", facecolor='lightblue'))
-        ax.text2D(0.02, 0.82, f'Yaw: {self.current_yaw:.1f}°', transform=ax.transAxes, 
-                 verticalalignment='top', fontsize=10, bbox=dict(boxstyle="round", facecolor='lightgreen'))
-        ax.text2D(0.02, 0.74, f'Temp: {self.temperature:.1f}°C', transform=ax.transAxes, 
-                 verticalalignment='top', fontsize=10, bbox=dict(boxstyle="round", facecolor='pink'))
-    
-    def update_plots(self, frame):
-        """Update all plots (called by animation)"""
-        self.update_data_buffers()
-        
-        if len(self.timestamps) == 0:
+        if len(self.time_data) < 2:
             return
         
-        # Get current rotation matrix
-        R = self.quaternion_to_rotation_matrix(
-            self.quaternion['q0'], self.quaternion['q1'], 
-            self.quaternion['q2'], self.quaternion['q3']
+        # Convert time to relative seconds
+        time_array = np.array(self.time_data)
+        time_rel = time_array - time_array[0] if len(time_array) > 0 else time_array
+        
+        # Plot 1: Raw Accelerometer
+        ax = self.axes[0, 0]
+        ax.plot(time_rel, self.acc_x, 'r-', label='X', linewidth=1)
+        ax.plot(time_rel, self.acc_y, 'g-', label='Y', linewidth=1)
+        ax.plot(time_rel, self.acc_z, 'b-', label='Z', linewidth=1)
+        ax.set_title("Raw Accelerometer", fontsize=10)
+        ax.set_ylabel("Acceleration (m/s²)", fontsize=8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 2: Linear Acceleration (gravity compensated)
+        ax = self.axes[0, 1]
+        ax.plot(time_rel, self.g_acc_x, 'r-', label='X', linewidth=1)
+        ax.plot(time_rel, self.g_acc_y, 'g-', label='Y', linewidth=1)
+        ax.plot(time_rel, self.g_acc_z, 'b-', label='Z', linewidth=1)
+        ax.set_title("Linear Acceleration", fontsize=10)
+        ax.set_ylabel("Acceleration (m/s²)", fontsize=8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 3: Gyroscope (convert to degrees/s)
+        ax = self.axes[1, 0]
+        gyro_x_deg = np.array(self.gyro_x) * 180.0 / np.pi
+        gyro_y_deg = np.array(self.gyro_y) * 180.0 / np.pi
+        gyro_z_deg = np.array(self.gyro_z) * 180.0 / np.pi
+        ax.plot(time_rel, gyro_x_deg, 'r-', label='X', linewidth=1)
+        ax.plot(time_rel, gyro_y_deg, 'g-', label='Y', linewidth=1)
+        ax.plot(time_rel, gyro_z_deg, 'b-', label='Z', linewidth=1)
+        ax.set_title("Gyroscope", fontsize=10)
+        ax.set_ylabel("Angular Velocity (°/s)", fontsize=8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 4: Orientation
+        ax = self.axes[1, 1]
+        ax.plot(time_rel, self.roll, 'r-', label='Roll', linewidth=1)
+        ax.plot(time_rel, self.pitch, 'g-', label='Pitch', linewidth=1)
+        ax.plot(time_rel, self.yaw, 'b-', label='Yaw', linewidth=1)
+        ax.set_title("Orientation", fontsize=10)
+        ax.set_ylabel("Angle (°)", fontsize=8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 5: Velocity
+        ax = self.axes[2, 0]
+        ax.plot(time_rel, self.vel_x, 'r-', label='X', linewidth=1)
+        ax.plot(time_rel, self.vel_y, 'g-', label='Y', linewidth=1)
+        ax.plot(time_rel, self.vel_z, 'b-', label='Z', linewidth=1)
+        ax.set_title("Velocity", fontsize=10)
+        ax.set_xlabel("Time (s)", fontsize=8)
+        ax.set_ylabel("Velocity (m/s)", fontsize=8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 6: Position
+        ax = self.axes[2, 1]
+        ax.plot(time_rel, self.pos_x, 'r-', label='X', linewidth=1)
+        ax.plot(time_rel, self.pos_y, 'g-', label='Y', linewidth=1)
+        ax.plot(time_rel, self.pos_z, 'b-', label='Z', linewidth=1)
+        ax.set_title("Position", fontsize=10)
+        ax.set_xlabel("Time (s)", fontsize=8)
+        ax.set_ylabel("Position (m)", fontsize=8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Adjust layout and redraw
+        self.fig.tight_layout(pad=2.0)
+        self.canvas.draw_idle()
+    
+    def add_data_point(self, data):
+        """Add a new data point to all deques"""
+        current_time = time.time()
+        self.time_data.append(current_time)
+        
+        # Raw accelerometer (indices 0-2)
+        self.acc_x.append(data[0])
+        self.acc_y.append(data[1])
+        self.acc_z.append(data[2])
+        
+        # Gravity-compensated acceleration (indices 3-5)
+        self.g_acc_x.append(data[3])
+        self.g_acc_y.append(data[4])
+        self.g_acc_z.append(data[5])
+        
+        # Raw gyroscope (indices 6-8)
+        self.gyro_x.append(data[6])
+        self.gyro_y.append(data[7])
+        self.gyro_z.append(data[8])
+        
+        # Skip filtered gyro (indices 9-11)
+        # Temperature (index 12)
+        temp = data[12]
+        self.temperature.append(temp)
+        
+        # Orientation (indices 13-15)
+        self.roll.append(data[13])
+        self.pitch.append(data[14])
+        self.yaw.append(data[15])
+        
+        # Skip quaternions (indices 16-19)
+        
+        # Velocity (indices 20-22) and filtered velocity (indices 23-25)
+        self.vel_x.append(data[23])  # Use filtered velocity
+        self.vel_y.append(data[24])
+        self.vel_z.append(data[25])
+        
+        # Position (indices 26-28)
+        self.pos_x.append(data[26])
+        self.pos_y.append(data[27])
+        self.pos_z.append(data[28])
+        
+        # Stationary flag (index 29)
+        self.stationary.append(data[29])
+        
+        self.sample_count += 1
+        
+        # Update live metrics
+        self.update_metrics(data)
+    
+    def update_metrics(self, data):
+        """Update the live metrics display"""
+        try:
+            # Accelerometer
+            self.metric_vars["Acceleration (m/s²)_X"].set(f"{data[0]:.3f}")
+            self.metric_vars["Acceleration (m/s²)_Y"].set(f"{data[1]:.3f}")
+            self.metric_vars["Acceleration (m/s²)_Z"].set(f"{data[2]:.3f}")
+            
+            # Linear acceleration
+            self.metric_vars["Linear Accel (m/s²)_X"].set(f"{data[3]:.3f}")
+            self.metric_vars["Linear Accel (m/s²)_Y"].set(f"{data[4]:.3f}")
+            self.metric_vars["Linear Accel (m/s²)_Z"].set(f"{data[5]:.3f}")
+            
+            # Gyroscope (convert to degrees/s)
+            self.metric_vars["Gyroscope (°/s)_X"].set(f"{data[6] * 180.0 / np.pi:.2f}")
+            self.metric_vars["Gyroscope (°/s)_Y"].set(f"{data[7] * 180.0 / np.pi:.2f}")
+            self.metric_vars["Gyroscope (°/s)_Z"].set(f"{data[8] * 180.0 / np.pi:.2f}")
+            
+            # Orientation
+            self.metric_vars["Orientation (°)_Roll"].set(f"{data[13]:.1f}")
+            self.metric_vars["Orientation (°)_Pitch"].set(f"{data[14]:.1f}")
+            self.metric_vars["Orientation (°)_Yaw"].set(f"{data[15]:.1f}")
+            
+            # Velocity (filtered)
+            self.metric_vars["Velocity (m/s)_X"].set(f"{data[23]:.3f}")
+            self.metric_vars["Velocity (m/s)_Y"].set(f"{data[24]:.3f}")
+            self.metric_vars["Velocity (m/s)_Z"].set(f"{data[25]:.3f}")
+            
+            # Position
+            self.metric_vars["Position (m)_X"].set(f"{data[26]:.3f}")
+            self.metric_vars["Position (m)_Y"].set(f"{data[27]:.3f}")
+            self.metric_vars["Position (m)_Z"].set(f"{data[28]:.3f}")
+            
+            # Status
+            self.metric_vars["Status_Temp (°C)"].set(f"{data[12]:.1f}")
+            self.metric_vars["Status_Stationary"].set("Yes" if data[29] == 1 else "No")
+            
+        except KeyError as e:
+            print(f"Metric update error: {e}")
+    
+    def save_data(self):
+        """Save current data to CSV file"""
+        if self.sample_count == 0:
+            messagebox.showwarning("No Data", "No data to save!")
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialname=f"bmi088_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         )
         
-        # Update 3D orientation plot
-        self.draw_3d_object(self.ax3d, R)
-        
-        # Update sensor plots
-        times = list(self.timestamps)
-        if len(times) > 1:
-            # Accelerometer plot
-            self.ax_accel.clear()
-            self.ax_accel.plot(times, list(self.accel_data['x']), 'r-', label='Ax', alpha=0.8)
-            self.ax_accel.plot(times, list(self.accel_data['y']), 'g-', label='Ay', alpha=0.8)
-            self.ax_accel.plot(times, list(self.accel_data['z']), 'b-', label='Az', alpha=0.8)
-            self.ax_accel.set_ylabel('Acceleration (m/s²)')
-            self.ax_accel.legend(loc='upper right')
-            self.ax_accel.grid(True, alpha=0.3)
-            self.ax_accel.set_title('Accelerometer Data')
-            
-            # Gyroscope plot
-            self.ax_gyro.clear()
-            self.ax_gyro.plot(times, list(self.gyro_data['x']), 'r-', label='Gx', alpha=0.8)
-            self.ax_gyro.plot(times, list(self.gyro_data['y']), 'g-', label='Gy', alpha=0.8)
-            self.ax_gyro.plot(times, list(self.gyro_data['z']), 'b-', label='Gz', alpha=0.8)
-            self.ax_gyro.set_ylabel('Angular Velocity (rad/s)')
-            self.ax_gyro.legend(loc='upper right')
-            self.ax_gyro.grid(True, alpha=0.3)
-            self.ax_gyro.set_title('Gyroscope Data')
-            
-            # Euler angles plot
-            self.ax_euler.clear()
-            self.ax_euler.plot(times, list(self.euler_data['roll']), 'r-', label='Roll', alpha=0.8)
-            self.ax_euler.plot(times, list(self.euler_data['pitch']), 'g-', label='Pitch', alpha=0.8)
-            self.ax_euler.plot(times, list(self.euler_data['yaw']), 'b-', label='Yaw', alpha=0.8)
-            self.ax_euler.set_ylabel('Angle (°)')
-            self.ax_euler.set_xlabel('Time (s)')
-            self.ax_euler.legend(loc='upper right')
-            self.ax_euler.grid(True, alpha=0.3)
-            self.ax_euler.set_title('Orientation (Euler Angles)')
+        if filename:
+            try:
+                # Save data with headers
+                headers = [
+                    'timestamp', 'raw_acc_x', 'raw_acc_y', 'raw_acc_z',
+                    'g_acc_x', 'g_acc_y', 'g_acc_z',
+                    'gyro_x', 'gyro_y', 'gyro_z',
+                    'roll', 'pitch', 'yaw',
+                    'vel_x', 'vel_y', 'vel_z',
+                    'pos_x', 'pos_y', 'pos_z',
+                    'temperature', 'stationary'
+                ]
+                
+                with open(filename, 'w') as f:
+                    f.write(','.join(headers) + '\n')
+                    
+                    for i in range(len(self.time_data)):
+                        row = [
+                            self.time_data[i],
+                            self.acc_x[i], self.acc_y[i], self.acc_z[i],
+                            self.g_acc_x[i], self.g_acc_y[i], self.g_acc_z[i],
+                            self.gyro_x[i], self.gyro_y[i], self.gyro_z[i],
+                            self.roll[i], self.pitch[i], self.yaw[i],
+                            self.vel_x[i], self.vel_y[i], self.vel_z[i],
+                            self.pos_x[i], self.pos_y[i], self.pos_z[i],
+                            self.temperature[i], self.stationary[i]
+                        ]
+                        f.write(','.join(map(str, row)) + '\n')
+                
+                messagebox.showinfo("Success", f"Data saved to {filename}")
+                
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Failed to save data: {str(e)}")
     
-    def run(self):
-        """Main visualization loop"""
-        if not self.connect_serial():
-            return
-        
-        # Set up the plot
-        self.fig = plt.figure(figsize=(15, 10))
-        
-        # Create subplots
-        self.ax3d = self.fig.add_subplot(2, 2, 1, projection='3d')
-        self.ax_accel = self.fig.add_subplot(2, 2, 2)
-        self.ax_gyro = self.fig.add_subplot(2, 2, 3)
-        self.ax_euler = self.fig.add_subplot(2, 2, 4)
-        
-        plt.tight_layout()
-        
-        # Start serial reading thread
-        self.running = True
-        serial_thread = threading.Thread(target=self.read_serial_data)
-        serial_thread.daemon = True
-        serial_thread.start()
-        
-        # Start animation
-        ani = FuncAnimation(self.fig, self.update_plots, interval=50, blit=False)
-        
-        try:
-            plt.show()
-        except KeyboardInterrupt:
-            print("Stopping visualization...")
-        finally:
-            self.running = False
-            if self.serial_conn:
-                self.serial_conn.close()
+    def clear_data(self):
+        """Clear all stored data"""
+        if messagebox.askyesno("Clear Data", "Are you sure you want to clear all data?"):
+            # Clear all deques
+            for attr_name in dir(self):
+                attr = getattr(self, attr_name)
+                if isinstance(attr, deque):
+                    attr.clear()
+            
+            self.sample_count = 0
+            self.start_time = time.time() if self.connected else None
+            
+            # Reset metric displays
+            for var in self.metric_vars.values():
+                var.set("0.000")
+    
+    def on_closing(self):
+        """Handle window closing"""
+        self.disconnect()
+        self.root.quit()
 
 
 def main():
-    """Main function"""
-    print("IMU Real-time Visualizer")
-    print("Make sure your Arduino is connected and running the BMI088+Madgwick code")
+    root = tk.Tk()
+    dashboard = BMI088Dashboard(root)
     
-    # Configure your serial port here
-    port = input("Enter serial port (e.g., COM3 on Windows, /dev/ttyUSB0 on Linux): ").strip()
-    if not port:
-        port = "COM3"  # Default for Windows
+    # Handle window closing
+    root.protocol("WM_DELETE_WINDOW", dashboard.on_closing)
     
-    visualizer = IMUVisualizer(port=port, baudrate=115200)
-    visualizer.run()
+    # Start the GUI
+    root.mainloop()
 
 
 if __name__ == "__main__":
