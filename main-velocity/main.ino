@@ -128,23 +128,23 @@ float applyAdaptiveThreshold(float acceleration, bool moving) {
     return (abs(acceleration) < threshold) ? 0.0f : acceleration;
 }
 
-// PHYSICS VALIDATION FUNCTION
+// PHYSICS VALIDATION FUNCTION - FIXED: Use pos_est instead of vel_est for world velocities
 void validatePhysics() {
-    // Check for unrealistic speeds
-    float speed = sqrt(vel_est.vx_world*vel_est.vx_world + 
-                      vel_est.vy_world*vel_est.vy_world + 
-                      vel_est.vz_world*vel_est.vz_world);
+    // Check for unrealistic speeds - FIXED: Use pos_est.vx_world instead of vel_est.vx_world
+    float speed = sqrt(pos_est.vx_world*pos_est.vx_world + 
+                      pos_est.vy_world*pos_est.vy_world + 
+                      pos_est.vz_world*pos_est.vz_world);
     
     if (speed > max_realistic_speed) {
         Serial.print("WARNING: Unrealistic speed: ");
         Serial.print(speed * 3.6f); // Convert to km/h
         Serial.println(" km/h");
         
-        // Scale down velocities to maximum realistic
+        // Scale down velocities to maximum realistic - FIXED: Use pos_est
         float scale_factor = max_realistic_speed / speed;
-        vel_est.vx_world *= scale_factor;
-        vel_est.vy_world *= scale_factor;
-        vel_est.vz_world *= scale_factor;
+        pos_est.vx_world *= scale_factor;
+        pos_est.vy_world *= scale_factor;
+        pos_est.vz_world *= scale_factor;
         vel_est.filtered_vx *= scale_factor;
         vel_est.filtered_vy *= scale_factor;
         vel_est.filtered_vz *= scale_factor;
